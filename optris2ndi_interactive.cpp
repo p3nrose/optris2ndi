@@ -45,6 +45,7 @@ public:
           frame_count_(0),
           auto_flag_enabled_(true),
           overlay_visible_(true),
+          preview_visible_(true),
           current_palette_index_(0),
           image_builder_(std::make_unique<ImageBuilder>(ColorFormat::RGB, WidthAlignment::OneByte)),
           fps_(std::make_unique<FramerateCounter>(100))
@@ -99,6 +100,17 @@ public:
 
         if (!display_ || !display_->isAlive()) {
             return false;
+        }
+
+        if (!preview_visible_) {
+            static const unsigned char black_pixel[3] = {0, 0, 0};
+            display_->draw(black_pixel,
+                           1,
+                           1,
+                           3,
+                           "",
+                           0.0);
+            return true;
         }
 
         FrameEvent event_copy;
@@ -222,6 +234,15 @@ public:
                     }
                     std::cout << "Overlay " << (overlay_visible_ ? "enabled" : "disabled") << std::endl;
                     break;
+                case 'n':
+                case 'N':
+                    preview_visible_ = !preview_visible_;
+                    if (display_) {
+                        display_->setShowHelp(preview_visible_ && overlay_visible_);
+                        display_->setShowFPS(preview_visible_ && overlay_visible_);
+                    }
+                    std::cout << "Preview " << (preview_visible_ ? "enabled" : "disabled") << std::endl;
+                    break;
                 case 'a':
                 case 'A':
                     auto_flag_enabled_ = !auto_flag_enabled_;
@@ -282,6 +303,7 @@ private:
         display_ = std::make_unique<Obvious2D>(width_, height_, title.str());
         display_->registerKeyboardClient('p', this, "Cycle Palette", Obvious2D::GREEN, Obvious2D::BLACK);
         display_->registerKeyboardClient('v', this, "Toggle Overlay", Obvious2D::GREEN, Obvious2D::BLACK);
+        display_->registerKeyboardClient('n', this, "Toggle Preview", Obvious2D::GREEN, Obvious2D::BLACK);
         display_->registerKeyboardClient('a', this, "Toggle Auto Flag", Obvious2D::GREEN, Obvious2D::BLACK);
         display_->registerKeyboardClient('[', this, "Decrease Flag Interval", Obvious2D::GREEN, Obvious2D::BLACK);
         display_->registerKeyboardClient(']', this, "Increase Flag Interval", Obvious2D::GREEN, Obvious2D::BLACK);
@@ -382,6 +404,7 @@ private:
     int frame_count_;
     bool auto_flag_enabled_;
     bool overlay_visible_;
+    bool preview_visible_;
     float flag_min_interval_ = 30.0f;
     float flag_max_interval_ = 120.0f;
     std::vector<std::string> available_palettes_;
@@ -479,7 +502,7 @@ int main(int argc, char* argv[])
         }
 
         std::cout << "Starting thermal capture and NDI streaming..." << std::endl;
-        std::cout << "Controls: p palette | v overlay | a auto-flag | [/] interval | f force flag | q quit" << std::endl;
+        std::cout << "Controls: p palette | v overlay | n preview | a auto-flag | [/] interval | f force flag | q quit" << std::endl;
         std::cout << "Press Ctrl+C or q to exit" << std::endl;
 
         while (!exit_loop && viewer.render()) {
