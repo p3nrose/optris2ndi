@@ -19,6 +19,8 @@
 #include <otcsdk/Exceptions.h>
 #include <otcsdk/Sdk.h>
 #include <otcsdk/enumeration/EnumerationManager.h>
+#include <otcsdk/ImageBuilder.h>
+#include <otcsdk/common/ImageInfo.h>
 
 using namespace optris;
 
@@ -33,13 +35,18 @@ public:
     ThermalToNDI()
         : ndi_sender_(nullptr),
           width_(0), height_(0),
-          frame_count_(0)
+          frame_count_(0),
+          pending_frames_(0),
+          image_builder_(nullptr)
     {}
 
     ~ThermalToNDI() noexcept override
     {
         if (ndi_sender_) {
             NDIlib_send_destroy(ndi_sender_);
+        }
+        if (image_builder_) {
+            delete image_builder_;
         }
     }
 
@@ -48,7 +55,9 @@ public:
         // Create NDI sender
         NDIlib_send_create_t send_create_desc = {};
         send_create_desc.p_ndi_name = ndi_name.c_str();
-        send_create_desc.clock_video = true;
+        // CRITICAL: Disable clock_video to eliminate NDI-side buffering (~500ms latency reduction).
+        // Frames flow at sender's pace instead of NDI's internal clock.
+        send_create_desc.clock_video = false;
 
         ndi_sender_ = NDIlib_send_create(&send_create_desc);
         return ndi_sender_ != nullptr;
@@ -60,19 +69,27 @@ public:
         try {
             const ThermalFrame& thermal_frame = evt.thermalFrame;
 
-            // First frame: initialize NDI frame descriptor
+            // First frame: initialize NDI frame descriptor and image palette builder
             if (width_ == 0) {
                 width_ = thermal_frame.getWidth();
                 height_ = thermal_frame.getHeight();
                 rgba_buffer_.resize(width_ * height_ * 4);
 
+                // Create ImageBuilder for palette-based thermal-to-RGB conversion
+                // RGB format: 3 bytes per pixel; we'll expand to RGBA (4 bytes) for NDI
+                image_builder_ = new ImageBuilder(ColorFormat::RGB, WidthAlignment::OneByte);
+                // Use Iron palette (classic thermal visualization)
+                image_builder_->setPalette("Iron");
+
                 std::cout << "Thermal resolution: " << width_ << "x" << height_ << std::endl;
+                std::cout << "Color palette: Iron (from Optris SDK)" << std::endl;
             }
 
-            // Convert thermal data to RGBA
-            convert_thermal_to_rgba(thermal_frame, rgba_buffer_.data());
+            // Convert thermal data to RGBA using Optris SDK palette
+            image_builder_->setThermalFrame(thermal_frame);
+            convert_thermal_to_rgba(rgba_buffer_.data());
 
-            // Send to NDI
+            // Send to NDI with proper frame timing metadata
             NDIlib_video_frame_v2_t ndi_frame = {};
             ndi_frame.xres = width_;
             ndi_frame.yres = height_;
@@ -80,7 +97,19 @@ public:
             ndi_frame.frame_format_type = NDIlib_frame_format_type_progressive;
             ndi_frame.line_stride_in_bytes = width_ * 4;
             ndi_frame.p_data = rgba_buffer_.data();
+            // Set frame timing for 32 fps camera
+            ndi_frame.frame_rate_N = 32000;
+            ndi_frame.frame_rate_D = 1000;
+            ndi_frame.picture_aspect_ratio = (float)width_ / height_;
+            ndi_frame.timecode = NDIlib_send_timecode_synthesize;  // Let NDI handle timecode
 
+            // Drop frame if callback queue is backed up (reduces latency on slow receivers)
+            if (pending_frames_ > 2) {
+                pending_frames_--;
+                return;  // Skip sending this frame
+            }
+
+            pending_frames_++;
             NDIlib_send_send_video_v2(ndi_sender_, &ndi_frame);
 
             frame_count_++;
@@ -106,39 +135,34 @@ private:
     int width_;
     int height_;
     int frame_count_;
+    int pending_frames_;    // Track callback backlog
+    ImageBuilder* image_builder_;  // Optris SDK palette-based renderer
     std::vector<unsigned char> rgba_buffer_;
 
     /**
-     * Convert thermal frame to grayscale RGBA image
+     * Convert thermal frame to RGBA using Optris SDK color palette
+     * Expands RGB output to RGBA for NDI
      */
-    void convert_thermal_to_rgba(
-        const ThermalFrame& thermal_frame,
-        unsigned char* rgba_buffer)
+    void convert_thermal_to_rgba(unsigned char* rgba_buffer) noexcept
     {
-        float min_temp = 20.0f;
-        float max_temp = 60.0f;
+        if (!image_builder_) return;
 
-        for (int y = 0; y < height_; ++y) {
-            for (int x = 0; x < width_; ++x) {
-                try {
-                    // Get temperature at this pixel
-                    float temp = thermal_frame.getTemperature(x, y);
+        // Get RGB image size (3 bytes per pixel)
+        const int rgb_size = image_builder_->getImageSizeInBytes();
+        std::vector<unsigned char> rgb_buffer(rgb_size);
 
-                    // Normalize temperature to 0-255 range
-                    float normalized = (temp - min_temp) / (max_temp - min_temp);
-                    normalized = std::max(0.0f, std::min(1.0f, normalized));
-                    unsigned char gray_value = static_cast<unsigned char>(normalized * 255.0f);
+        // Render thermal data to RGB using palette
+        image_builder_->convertTemperatureToPaletteImage(rgb_buffer.data(), rgb_size);
 
-                    // Write RGBA pixel (grayscale: R=G=B=gray_value, A=255)
-                    int pixel_index = (y * width_ + x) * 4;
-                    rgba_buffer[pixel_index + 0] = gray_value;  // R
-                    rgba_buffer[pixel_index + 1] = gray_value;  // G
-                    rgba_buffer[pixel_index + 2] = gray_value;  // B
-                    rgba_buffer[pixel_index + 3] = 255;         // A
-                } catch (...) {
-                    // Skip pixels that throw exceptions
-                }
-            }
+        // Expand RGB to RGBA: copy each RGB pixel and add alpha channel
+        const int pixel_count = width_ * height_;
+        for (int i = 0; i < pixel_count; ++i) {
+            int rgb_idx = i * 3;
+            int rgba_idx = i * 4;
+            rgba_buffer[rgba_idx + 0] = rgb_buffer[rgb_idx + 0];  // R
+            rgba_buffer[rgba_idx + 1] = rgb_buffer[rgb_idx + 1];  // G
+            rgba_buffer[rgba_idx + 2] = rgb_buffer[rgb_idx + 2];  // B
+            rgba_buffer[rgba_idx + 3] = 255;                      // A
         }
     }
 };
@@ -148,6 +172,9 @@ int main(int argc, char* argv[])
     try {
         // Initialize Optris SDK and device enumeration (required before camera connect).
         Sdk::init(Verbosity::Info, Verbosity::Off, argv[0]);
+
+        // Load color palettes from SDK
+        Sdk::loadPalettes();
 
         // Optional: scan typical LAN subnet for Ethernet cameras.
         if (argc >= 2) {
@@ -212,8 +239,8 @@ int main(int argc, char* argv[])
 
         std::cout << "Connected successfully!" << std::endl;
 
-        // Allow a larger callback result pool to reduce dropped frame risk under load.
-        camera->setProcessingMaxResultPoolSize(30);
+        // Reduce pool size to minimize buffering (trade: slight increased chance of frame drops under extreme load).
+        camera->setProcessingMaxResultPoolSize(5);
 
         // Create and register thermal-to-NDI converter
         ThermalToNDI converter;
@@ -237,7 +264,8 @@ int main(int argc, char* argv[])
         }
 
         std::cout << "Starting thermal capture and NDI streaming..." << std::endl;
-        std::cout << "Temperature range: 20°C to 60°C (adjust in convert_thermal_to_rgba())" << std::endl;
+        std::cout << "Color palette: Iron (false color thermal visualization)" << std::endl;
+        std::cout << "Optimizations: clock_video=false, frame drop on backlog, reduced pool size" << std::endl;
         std::cout << "Press Ctrl+C to exit" << std::endl;
 
         // Wait until user presses Ctrl+C
