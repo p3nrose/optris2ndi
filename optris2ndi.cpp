@@ -3,9 +3,25 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fcntl.h>
+#include <mutex>
 #include <vector>
 #include <thread>
 #include <memory>
+#include <algorithm>
+#include <sys/select.h>
+#include <termios.h>
+#include <unistd.h>
+#if defined(__has_include)
+#  if __has_include(<SDL2/SDL.h>)
+#    include <SDL2/SDL.h>
+#    define HAVE_SDL 1
+#  else
+#    define HAVE_SDL 0
+#  endif
+#else
+#  define HAVE_SDL 0
+#endif
 
 // NDI headers
 #include <Processing.NDI.Lib.h>
@@ -37,7 +53,8 @@ public:
           width_(0), height_(0),
           frame_count_(0),
           pending_frames_(0),
-          image_builder_(nullptr)
+          preview_enabled_(false),
+          current_palette_index_(0)
     {}
 
     ~ThermalToNDI() noexcept override
@@ -45,9 +62,78 @@ public:
         if (ndi_sender_) {
             NDIlib_send_destroy(ndi_sender_);
         }
-        if (image_builder_) {
-            delete image_builder_;
+    }
+
+    bool setPreviewEnabled(bool enabled)
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        preview_enabled_ = enabled;
+        return preview_enabled_;
+    }
+
+    bool cyclePalette()
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (available_palettes_.empty() || !image_builder_) {
+            return false;
         }
+
+        current_palette_index_ = (current_palette_index_ + 1) % available_palettes_.size();
+        return applyPaletteUnlocked(available_palettes_[current_palette_index_]);
+    }
+
+    std::string currentPaletteName() const
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (available_palettes_.empty()) {
+            return "unknown";
+        }
+        return available_palettes_[current_palette_index_];
+    }
+
+    bool renderPreview(std::ostream& out)
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!preview_enabled_ || rgba_buffer_.empty() || width_ == 0 || height_ == 0) {
+            return false;
+        }
+
+        const int preview_width = 48;
+        const int preview_height = 24;
+        static const char* shade = " .:-=+*#%@";
+
+        out << "\033[H\033[J";
+        out << "Thermal preview | palette=" << currentPaletteNameUnlocked()
+            << " | frames=" << frame_count_ << "\n";
+
+        for (int y = 0; y < preview_height; ++y) {
+            const int src_y = y * height_ / preview_height;
+            for (int x = 0; x < preview_width; ++x) {
+                const int src_x = x * width_ / preview_width;
+                const int idx = (src_y * width_ + src_x) * 4;
+                const unsigned char r = rgba_buffer_[idx + 0];
+                const unsigned char g = rgba_buffer_[idx + 1];
+                const unsigned char b = rgba_buffer_[idx + 2];
+                const int luminance = (static_cast<int>(r) * 30 + static_cast<int>(g) * 59 + static_cast<int>(b) * 11) / 100;
+                const int shade_index = luminance * 9 / 255;
+                out << shade[shade_index];
+            }
+            out << '\n';
+        }
+
+        out << "Controls: p palette | v preview | a auto-flag | [/] interval | f force flag | q quit\n";
+        return true;
+    }
+
+    // Thread-safe getter for latest RGBA buffer
+    bool getLatestRGBA(std::vector<unsigned char>& out_buf, int& out_w, int& out_h) const
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (rgba_buffer_.empty() || width_ == 0 || height_ == 0) return false;
+        out_buf = rgba_buffer_;
+        out_w = width_;
+        out_h = height_;
+        return true;
     }
 
     bool initialize(const std::string& ndi_name)
@@ -75,19 +161,19 @@ public:
                 height_ = thermal_frame.getHeight();
                 rgba_buffer_.resize(width_ * height_ * 4);
 
-                // Create ImageBuilder for palette-based thermal-to-RGB conversion
-                // RGB format: 3 bytes per pixel; we'll expand to RGBA (4 bytes) for NDI
-                image_builder_ = new ImageBuilder(ColorFormat::RGB, WidthAlignment::OneByte);
-                // Use Iron palette (classic thermal visualization)
-                image_builder_->setPalette("Iron");
+                image_builder_ = std::make_unique<ImageBuilder>(ColorFormat::RGB, WidthAlignment::OneByte);
+                discoverPalettesUnlocked();
 
                 std::cout << "Thermal resolution: " << width_ << "x" << height_ << std::endl;
-                std::cout << "Color palette: Iron (from Optris SDK)" << std::endl;
+                std::cout << "Color palette: " << currentPaletteNameUnlocked() << " (Optris SDK)" << std::endl;
             }
 
             // Convert thermal data to RGBA using Optris SDK palette
-            image_builder_->setThermalFrame(thermal_frame);
-            convert_thermal_to_rgba(rgba_buffer_.data());
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                image_builder_->setThermalFrame(thermal_frame);
+                convert_thermal_to_rgbaUnlocked(rgba_buffer_.data());
+            }
 
             // Send to NDI with proper frame timing metadata
             NDIlib_video_frame_v2_t ndi_frame = {};
@@ -135,15 +221,19 @@ private:
     int width_;
     int height_;
     int frame_count_;
-    int pending_frames_;    // Track callback backlog
-    ImageBuilder* image_builder_;  // Optris SDK palette-based renderer
+    int pending_frames_;
+    bool preview_enabled_;
+    std::vector<std::string> available_palettes_;
+    std::size_t current_palette_index_;
+    std::unique_ptr<ImageBuilder> image_builder_;
+    mutable std::mutex state_mutex_;
     std::vector<unsigned char> rgba_buffer_;
 
     /**
      * Convert thermal frame to RGBA using Optris SDK color palette
      * Expands RGB output to RGBA for NDI
      */
-    void convert_thermal_to_rgba(unsigned char* rgba_buffer) noexcept
+    void convert_thermal_to_rgbaUnlocked(unsigned char* rgba_buffer) noexcept
     {
         if (!image_builder_) return;
 
@@ -165,6 +255,122 @@ private:
             rgba_buffer[rgba_idx + 3] = 255;                      // A
         }
     }
+
+    void discoverPalettesUnlocked()
+    {
+        available_palettes_.clear();
+
+        static const std::vector<std::string> candidates = {
+            "GrayBW",
+            "Iron"
+        };
+
+        for (const auto& palette : candidates) {
+            try {
+                image_builder_->setPalette(palette);
+                available_palettes_.push_back(palette);
+            } catch (const std::exception&) {
+            }
+        }
+
+        if (available_palettes_.empty()) {
+            available_palettes_.push_back("GrayBW");
+            image_builder_->setPalette("GrayBW");
+        }
+
+        current_palette_index_ = 0;
+        image_builder_->setPalette(available_palettes_[current_palette_index_]);
+    }
+
+    bool applyPaletteUnlocked(const std::string& palette)
+    {
+        if (!image_builder_) {
+            return false;
+        }
+
+        try {
+            image_builder_->setPalette(palette);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    std::string currentPaletteNameUnlocked() const
+    {
+        if (available_palettes_.empty()) {
+            return "unknown";
+        }
+
+        return available_palettes_[current_palette_index_];
+    }
+};
+
+class RawTerminal {
+public:
+    RawTerminal()
+        : active_(false),
+          old_flags_(-1)
+    {
+        if (!isatty(STDIN_FILENO)) {
+            return;
+        }
+
+        if (tcgetattr(STDIN_FILENO, &old_termios_) != 0) {
+            return;
+        }
+
+        termios raw = old_termios_;
+        raw.c_lflag &= static_cast<unsigned long>(~(ICANON | ECHO));
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 0;
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+            return;
+        }
+
+        old_flags_ = fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (old_flags_ != -1) {
+            fcntl(STDIN_FILENO, F_SETFL, old_flags_ | O_NONBLOCK);
+        }
+
+        active_ = true;
+    }
+
+    ~RawTerminal()
+    {
+        if (!active_) {
+            return;
+        }
+
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_termios_);
+        if (old_flags_ != -1) {
+            fcntl(STDIN_FILENO, F_SETFL, old_flags_);
+        }
+    }
+
+    bool readKey(char& key)
+    {
+        if (!active_) {
+            return false;
+        }
+
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+        timeval timeout {0, 100000};
+
+        const int ready = select(STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &timeout);
+        if (ready <= 0 || !FD_ISSET(STDIN_FILENO, &read_fds)) {
+            return false;
+        }
+
+        return read(STDIN_FILENO, &key, 1) == 1;
+    }
+
+private:
+    bool active_;
+    int old_flags_;
+    termios old_termios_;
 };
 
 int main(int argc, char* argv[])
@@ -241,6 +447,8 @@ int main(int argc, char* argv[])
 
         // Reduce pool size to minimize buffering (trade: slight increased chance of frame drops under extreme load).
         camera->setProcessingMaxResultPoolSize(5);
+        camera->setAutoFlagEnabled(true);
+        camera->setFlagInterval(30.0f, 120.0f);
 
         // Create and register thermal-to-NDI converter
         ThermalToNDI converter;
@@ -264,14 +472,160 @@ int main(int argc, char* argv[])
         }
 
         std::cout << "Starting thermal capture and NDI streaming..." << std::endl;
-        std::cout << "Color palette: Iron (false color thermal visualization)" << std::endl;
+        std::cout << "Color palette: dynamic, press p to cycle" << std::endl;
+        std::cout << "Controls: p palette | v preview | a auto-flag | [/] interval | f force flag | q quit" << std::endl;
         std::cout << "Optimizations: clock_video=false, frame drop on backlog, reduced pool size" << std::endl;
-        std::cout << "Press Ctrl+C to exit" << std::endl;
+        std::cout << "Press Ctrl+C or q to exit" << std::endl;
+
+        RawTerminal terminal_mode;
+        bool preview_enabled = false;
+        bool auto_flag_enabled = true;
+        float flag_min_interval = 30.0f;
+        float flag_max_interval = 120.0f;
+        converter.setPreviewEnabled(preview_enabled);
+        std::cout << "Auto-flag: on, interval 30s to 120s" << std::endl;
+
+        // Try to initialize SDL for windowed preview. If it fails, fallback to ASCII preview.
+#if HAVE_SDL
+        bool sdl_ok = false;
+        SDL_Window* window = nullptr;
+        SDL_Renderer* renderer = nullptr;
+        SDL_Texture* texture = nullptr;
+        int tex_w = 0, tex_h = 0;
+        if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+            sdl_ok = true;
+        } else {
+            std::cout << "SDL init failed, falling back to terminal preview" << std::endl;
+        }
+#else
+    bool sdl_ok = false;
+    void* window = nullptr;
+    void* renderer = nullptr;
+    void* texture = nullptr;
+    int tex_w = 0, tex_h = 0;
+    std::cout << "SDL not available at compile time, falling back to terminal preview" << std::endl;
+#endif
 
         // Wait until user presses Ctrl+C
         while (!exit_loop) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Handle SDL events if available (window keyboard will take precedence)
+#if HAVE_SDL
+            if (sdl_ok) {
+                SDL_Event ev;
+                while (SDL_PollEvent(&ev)) {
+                    if (ev.type == SDL_QUIT) exit_loop = true;
+                    if (ev.type == SDL_KEYDOWN) {
+                        char key = 0;
+                        switch (ev.key.keysym.sym) {
+                            case SDLK_q: key = 'q'; break;
+                            case SDLK_p: key = 'p'; break;
+                            case SDLK_v: key = 'v'; break;
+                            case SDLK_a: key = 'a'; break;
+                            case SDLK_LEFTBRACKET: key = '['; break;
+                            case SDLK_RIGHTBRACKET: key = ']'; break;
+                            case SDLK_f: key = 'f'; break;
+                            default: key = 0; break;
+                        }
+                        if (key) {
+                            terminal_mode.readKey(key); // no-op, keep uniform handling
+                            switch (key) {
+                                case 'q': case 'Q': exit_loop = true; break;
+                                case 'p': case 'P': if (converter.cyclePalette()) std::cout << "Palette changed to " << converter.currentPaletteName() << std::endl; break;
+                                case 'v': case 'V': preview_enabled = !preview_enabled; converter.setPreviewEnabled(preview_enabled); std::cout << "Preview " << (preview_enabled ? "enabled" : "disabled") << std::endl; break;
+                                case 'a': case 'A': auto_flag_enabled = !auto_flag_enabled; camera->setAutoFlagEnabled(auto_flag_enabled); std::cout << "Auto-flag " << (auto_flag_enabled ? "enabled" : "disabled") << std::endl; break;
+                                case '[': flag_max_interval = std::max(10.0f, flag_max_interval - 10.0f); flag_min_interval = std::min(flag_min_interval, flag_max_interval - 5.0f); if (flag_min_interval < 5.0f) flag_min_interval = 5.0f; camera->setFlagInterval(flag_min_interval, flag_max_interval); std::cout << "Flag interval: " << flag_min_interval << "s to " << flag_max_interval << "s" << std::endl; break;
+                                case ']': flag_max_interval = std::min(300.0f, flag_max_interval + 10.0f); flag_min_interval = std::min(flag_min_interval + 5.0f, flag_max_interval - 5.0f); camera->setFlagInterval(flag_min_interval, flag_max_interval); std::cout << "Flag interval: " << flag_min_interval << "s to " << flag_max_interval << "s" << std::endl; break;
+                                case 'f': case 'F': camera->forceFlagEvent(); std::cout << "Forced flag cycle" << std::endl; break;
+                            }
+                        }
+                    }
+                }
+            }
+#endif
+
+            char key = 0;
+            if (!sdl_ok && terminal_mode.readKey(key)) {
+                switch (key) {
+                    case 'q':
+                    case 'Q':
+                        exit_loop = true;
+                        break;
+                    case 'p':
+                    case 'P':
+                        if (converter.cyclePalette()) {
+                            std::cout << "Palette changed to " << converter.currentPaletteName() << std::endl;
+                        }
+                        break;
+                    case 'v':
+                    case 'V':
+                        preview_enabled = !preview_enabled;
+                        converter.setPreviewEnabled(preview_enabled);
+                        std::cout << "Preview " << (preview_enabled ? "enabled" : "disabled") << std::endl;
+                        break;
+                    case 'a':
+                    case 'A':
+                        auto_flag_enabled = !auto_flag_enabled;
+                        camera->setAutoFlagEnabled(auto_flag_enabled);
+                        std::cout << "Auto-flag " << (auto_flag_enabled ? "enabled" : "disabled") << std::endl;
+                        break;
+                    case '[':
+                        flag_max_interval = std::max(10.0f, flag_max_interval - 10.0f);
+                        flag_min_interval = std::min(flag_min_interval, flag_max_interval - 5.0f);
+                        if (flag_min_interval < 5.0f) flag_min_interval = 5.0f;
+                        camera->setFlagInterval(flag_min_interval, flag_max_interval);
+                        std::cout << "Flag interval: " << flag_min_interval << "s to " << flag_max_interval << "s" << std::endl;
+                        break;
+                    case ']':
+                        flag_max_interval = std::min(300.0f, flag_max_interval + 10.0f);
+                        flag_min_interval = std::min(flag_min_interval + 5.0f, flag_max_interval - 5.0f);
+                        camera->setFlagInterval(flag_min_interval, flag_max_interval);
+                        std::cout << "Flag interval: " << flag_min_interval << "s to " << flag_max_interval << "s" << std::endl;
+                        break;
+                    case 'f':
+                    case 'F':
+                        camera->forceFlagEvent();
+                        std::cout << "Forced flag cycle" << std::endl;
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            // SDL preview: fetch latest RGBA and update texture
+            if (sdl_ok && preview_enabled) {
+                std::vector<unsigned char> latest;
+                int lw=0, lh=0;
+                if (converter.getLatestRGBA(latest, lw, lh)) {
+#if HAVE_SDL
+                    if (!window) {
+                        tex_w = lw; tex_h = lh;
+                        window = SDL_CreateWindow("Optris Thermal", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, tex_w, tex_h, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+                        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+                        texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h);
+                    }
+                    if (texture) {
+                        SDL_UpdateTexture(texture, NULL, latest.data(), tex_w * 4);
+                        SDL_RenderClear(renderer);
+                        SDL_RenderCopy(renderer, texture, NULL, NULL);
+                        SDL_RenderPresent(renderer);
+                    }
+#endif
+                }
+            } else if (preview_enabled) {
+                converter.renderPreview(std::cout);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+
+#if HAVE_SDL
+        if (sdl_ok) {
+            if (texture) SDL_DestroyTexture(texture);
+            if (renderer) SDL_DestroyRenderer(renderer);
+            if (window) SDL_DestroyWindow(window);
+            SDL_Quit();
+        }
+#endif
 
         // Cleanup
         std::cout << "\nShutting down..." << std::endl;
